@@ -4,6 +4,11 @@ import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/p
 import path from 'node:path';
 
 import { syncAstroTypesBeforeLint } from './astro-sync.ts';
+import {
+  AGENT_WORKTREES,
+  consumerIgnoreWarnings,
+  syncConsumerIgnores,
+} from './consumer-ignores.ts';
 
 export interface WebPreset {
   formatVersion: number;
@@ -147,38 +152,23 @@ export async function applyPreset(root: string, bundle: WebPreset, dryRun = fals
       .sort()
       .filter((name) => !(name in bundle.files)),
   };
-  const consumerChanged = [
-    ...new Set([
-      ...(await migrateLegacyPackageScope(root, dryRun)),
-      ...(await ignorePlaywrightOutput(root, dryRun)),
-      ...(await syncAstroTypesBeforeLint(root, dryRun)),
-    ]),
-  ].sort();
-  if (!dryRun) await install(root, bundle);
+  const migrate = async (dry: boolean) =>
+    [
+      ...new Set([
+        ...(await migrateLegacyPackageScope(root, dry)),
+        ...(await syncConsumerIgnores(root, dry)),
+        ...(await syncAstroTypesBeforeLint(root, dry)),
+      ]),
+    ].sort();
+  // Planning first means a consumer file a migration can't read stops the update before any write.
+  const consumerChanged = await migrate(true);
+  for (const warning of await consumerIgnoreWarnings(root))
+    process.stderr.write(`warning: ${warning}\n`);
+  if (!dryRun) {
+    await migrate(false);
+    await install(root, bundle);
+  }
   return { ...plan, consumerChanged };
-}
-
-// Playwright writes these beside each app's configuration, such as apps/site/test-results/.
-// Every example's .gitignore carries the same rules. A slash inside a pattern anchors it to the
-// .gitignore's own directory, so the cache rule needs its leading **/ to reach every app.
-export const PLAYWRIGHT_OUTPUT_IGNORES = [
-  'test-results/',
-  'playwright-report/',
-  'blob-report/',
-  '**/playwright/.cache/',
-];
-
-/** Appends the rules a consumer's root .gitignore lacks, leaving its own lines untouched. */
-async function ignorePlaywrightOutput(root: string, dryRun: boolean): Promise<string[]> {
-  const file = path.join(root, '.gitignore');
-  const source = await readFile(file, 'utf8').catch(() => null);
-  if (source === null) return [];
-  const present = new Set(source.split(/\r?\n/).map((line) => line.trim()));
-  const missing = PLAYWRIGHT_OUTPUT_IGNORES.filter((rule) => !present.has(rule));
-  if (missing.length === 0) return [];
-  const separator = source === '' || source.endsWith('\n') ? '' : '\n';
-  if (!dryRun) await writeFile(file, `${source}${separator}${missing.join('\n')}\n`);
-  return ['.gitignore'];
 }
 
 const SKIPPED_DIRECTORIES = new Set([
@@ -206,8 +196,14 @@ async function consumerFiles(root: string, relative = ''): Promise<string[]> {
   for (const entry of await readdir(directory, { withFileTypes: true })) {
     if (entry.name === '.lvbt' && relative === '') continue;
     if (entry.isDirectory()) {
-      if (!SKIPPED_DIRECTORIES.has(entry.name))
-        files.push(...(await consumerFiles(root, path.join(relative, entry.name))));
+      const directory = path.join(relative, entry.name);
+      // A nested checkout, such as an agent worktree under .claude/worktrees/, is another branch's,
+      // and so is a worktree folder whose .git is already gone.
+      const nested =
+        directory === path.join(...AGENT_WORKTREES.split('/')) ||
+        existsSync(path.join(root, directory, '.git'));
+      if (!SKIPPED_DIRECTORIES.has(entry.name) && !nested)
+        files.push(...(await consumerFiles(root, directory)));
       continue;
     }
     if (entry.isFile()) files.push(path.join(relative, entry.name));
